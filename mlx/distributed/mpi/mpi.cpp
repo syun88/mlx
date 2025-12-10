@@ -1,10 +1,22 @@
 // Copyright © 2024 Apple Inc.
 
+#include <algorithm>
 #include <dlfcn.h>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 
+#if defined(MLX_BUILD_CPU)
 #include "mlx/backend/cpu/encoder.h"
+#endif
+#if defined(MLX_BUILD_CUDA)
+#include <cuda_runtime.h>
+#include "mlx/backend/cuda/cuda.h"
+#include "mlx/backend/cuda/device.h"
+#include "mlx/backend/cuda/utils.h"
+#endif
 #include "mlx/distributed/distributed.h"
 #include "mlx/distributed/distributed_impl.h"
 #include "mlx/distributed/mpi/mpi.h"
@@ -346,7 +358,20 @@ MPIWrapper& mpi() {
 class MPIGroup : public GroupImpl {
  public:
   MPIGroup(MPI_Comm comm, bool global)
-      : comm_(comm), global_(global), rank_(-1), size_(-1) {}
+      : comm_(comm), global_(global), rank_(-1), size_(-1), has_cuda_(false) {
+#if defined(MLX_BUILD_CUDA)
+    has_cuda_ = cu::is_available();
+    if (has_cuda_) {
+      int device_count = 0;
+      if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        has_cuda_ = false;
+      } else {
+        int target_device = rank() % device_count;
+        CHECK_CUDA_ERROR(cudaSetDevice(target_device));
+      }
+    }
+#endif
+  }
 
   virtual ~MPIGroup() {
     if (global_) {
@@ -357,6 +382,11 @@ class MPIGroup : public GroupImpl {
   }
 
   Stream communication_stream(StreamOrDevice s) override {
+#if defined(MLX_BUILD_CUDA)
+    if (has_cuda_) {
+      return to_stream(s, Device::gpu);
+    }
+#endif
     return to_stream(s, Device::cpu);
   }
 
@@ -387,36 +417,104 @@ class MPIGroup : public GroupImpl {
   }
 
   void all_sum(const array& input, array& output, Stream stream) override {
-    auto& encoder = cpu::get_command_encoder(stream);
-    encoder.set_input_array(input);
-    encoder.set_output_array(output);
-    encoder.dispatch(
-        mpi().all_reduce,
-        (input.data<void>() == output.data<void>()) ? MPI_IN_PLACE
-                                                    : input.data<void>(),
-        output.data<void>(),
-        input.size(),
-        mpi().datatype(input),
-        mpi().op_sum(input),
-        comm_);
+    dispatch_all_reduce(input, output, stream, ReduceType::Sum);
   }
 
   void all_max(const array& input, array& output, Stream stream) override {
-    auto& encoder = cpu::get_command_encoder(stream);
-    encoder.set_input_array(input);
-    encoder.set_output_array(output);
-    encoder.dispatch(
-        mpi().all_reduce,
-        (input.data<void>() == output.data<void>()) ? MPI_IN_PLACE
-                                                    : input.data<void>(),
-        output.data<void>(),
-        input.size(),
-        mpi().datatype(input),
-        mpi().op_max(input),
-        comm_);
+    dispatch_all_reduce(input, output, stream, ReduceType::Max);
   }
 
   void all_min(const array& input, array& output, Stream stream) override {
+    dispatch_all_reduce(input, output, stream, ReduceType::Min);
+  }
+
+  void all_gather(const array& input, array& output, Stream stream) override {
+    if (is_gpu_stream(stream)) {
+#if defined(MLX_BUILD_CUDA)
+      all_gather_gpu(input, output, stream);
+#else
+      throw std::runtime_error(
+          "[mpi] GPU communication requested but CUDA support is not enabled.");
+#endif
+    } else {
+#if defined(MLX_BUILD_CPU)
+      all_gather_cpu(input, output, stream);
+#else
+      throw std::runtime_error(
+          "[mpi] CPU communication requested but CPU support is not enabled.");
+#endif
+    }
+  }
+
+  void send(const array& input, int dst, Stream stream) override {
+    if (is_gpu_stream(stream)) {
+#if defined(MLX_BUILD_CUDA)
+      send_gpu(input, dst, stream);
+#else
+      throw std::runtime_error(
+          "[mpi] GPU communication requested but CUDA support is not enabled.");
+#endif
+    } else {
+#if defined(MLX_BUILD_CPU)
+      send_cpu(input, dst, stream);
+#else
+      throw std::runtime_error(
+          "[mpi] CPU communication requested but CPU support is not enabled.");
+#endif
+    }
+  }
+
+  void recv(array& out, int src, Stream stream) override {
+    if (is_gpu_stream(stream)) {
+#if defined(MLX_BUILD_CUDA)
+      recv_gpu(out, src, stream);
+#else
+      throw std::runtime_error(
+          "[mpi] GPU communication requested but CUDA support is not enabled.");
+#endif
+    } else {
+#if defined(MLX_BUILD_CPU)
+      recv_cpu(out, src, stream);
+#else
+      throw std::runtime_error(
+          "[mpi] CPU communication requested but CPU support is not enabled.");
+#endif
+    }
+  }
+
+  void sum_scatter(const array& input, array& output, Stream stream) override {
+    throw std::runtime_error("[mpi] sum_scatter not yet implemented.");
+  }
+
+  bool supports_cuda_graphs() const override {
+#if defined(MLX_BUILD_CUDA)
+    return false;
+#else
+    return true;
+#endif
+  }
+
+ private:
+  enum class ReduceType { Sum, Max, Min };
+
+  bool is_gpu_stream(Stream stream) const {
+    return stream.device.type == Device::gpu;
+  }
+
+  MPI_Op mpi_op(ReduceType reduce, const array& input) const {
+    switch (reduce) {
+      case ReduceType::Sum:
+        return mpi().op_sum(input);
+      case ReduceType::Max:
+        return mpi().op_max(input);
+      case ReduceType::Min:
+        return mpi().op_min(input);
+    }
+    return mpi().op_sum(input);
+  }
+
+#if defined(MLX_BUILD_CPU)
+  void all_reduce_cpu(const array& input, array& output, Stream stream, MPI_Op op) {
     auto& encoder = cpu::get_command_encoder(stream);
     encoder.set_input_array(input);
     encoder.set_output_array(output);
@@ -427,11 +525,11 @@ class MPIGroup : public GroupImpl {
         output.data<void>(),
         input.size(),
         mpi().datatype(input),
-        mpi().op_min(input),
+        op,
         comm_);
   }
 
-  void all_gather(const array& input, array& output, Stream stream) override {
+  void all_gather_cpu(const array& input, array& output, Stream stream) {
     auto& encoder = cpu::get_command_encoder(stream);
     encoder.set_input_array(input);
     encoder.set_output_array(output);
@@ -446,7 +544,7 @@ class MPIGroup : public GroupImpl {
         comm_);
   }
 
-  void send(const array& input, int dst, Stream stream) override {
+  void send_cpu(const array& input, int dst, Stream stream) {
     auto& encoder = cpu::get_command_encoder(stream);
     encoder.set_input_array(input);
     encoder.dispatch(
@@ -459,7 +557,7 @@ class MPIGroup : public GroupImpl {
         comm_);
   }
 
-  void recv(array& out, int src, Stream stream) override {
+  void recv_cpu(array& out, int src, Stream stream) {
     auto& encoder = cpu::get_command_encoder(stream);
     encoder.set_output_array(out);
     encoder.dispatch([out_ptr = out.data<void>(),
@@ -471,16 +569,159 @@ class MPIGroup : public GroupImpl {
       mpi().recv(out_ptr, out_size, out_type, src, MPI_ANY_TAG, comm, &status);
     });
   }
+#endif
 
-  void sum_scatter(const array& input, array& output, Stream stream) override {
-    throw std::runtime_error("[mpi] sum_scatter not yet implemented.");
+#if defined(MLX_BUILD_CUDA)
+  bool requires_custom_reduction(Dtype dtype, ReduceType reduce) const {
+    if (dtype == float16 || dtype == bfloat16) {
+      return true;
+    }
+    if ((reduce == ReduceType::Max || reduce == ReduceType::Min) &&
+        dtype == complex64) {
+      return true;
+    }
+    return false;
   }
 
- private:
+  void throw_if_custom_reduction(Dtype dtype, ReduceType reduce) const {
+    if (requires_custom_reduction(dtype, reduce)) {
+      throw std::runtime_error(
+          "[mpi] This reduction dtype is not supported on the CUDA MPI backend. "
+          "Cast tensors to float32 or run on CPU.");
+    }
+  }
+
+  void dispatch_all_reduce(
+      const array& input,
+      array& output,
+      Stream stream,
+      ReduceType reduce) {
+    if (is_gpu_stream(stream)) {
+      all_reduce_gpu(input, output, stream, reduce);
+    } else {
+#if defined(MLX_BUILD_CPU)
+      all_reduce_cpu(input, output, stream, mpi_op(reduce, input));
+#else
+      throw std::runtime_error(
+          "[mpi] CPU communication requested but CPU support is not enabled.");
+#endif
+    }
+  }
+
+  void all_reduce_gpu(
+      const array& input,
+      array& output,
+      Stream stream,
+      ReduceType reduce) {
+    if (!has_cuda_) {
+      throw std::runtime_error(
+          "[mpi] CUDA stream requested but CUDA backend is not available.");
+    }
+    throw_if_custom_reduction(input.dtype(), reduce);
+
+    auto& encoder = cu::get_command_encoder(stream);
+    encoder.set_input_array(input);
+    encoder.set_output_array(output);
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(encoder.stream()));
+    int result = mpi().all_reduce(
+        (input.data<void>() == output.data<void>()) ? MPI_IN_PLACE
+                                                    : gpu_ptr<void>(input),
+        gpu_ptr<void>(output),
+        input.size(),
+        mpi().datatype(input),
+        mpi_op(reduce, input),
+        comm_);
+    if (result != MPI_SUCCESS) {
+      throw std::runtime_error("[mpi] MPI_Allreduce failed.");
+    }
+  }
+
+  void all_gather_gpu(const array& input, array& output, Stream stream) {
+    if (!has_cuda_) {
+      throw std::runtime_error(
+          "[mpi] CUDA stream requested but CUDA backend is not available.");
+    }
+    auto& encoder = cu::get_command_encoder(stream);
+    encoder.set_input_array(input);
+    encoder.set_output_array(output);
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(encoder.stream()));
+    int result = mpi().all_gather(
+        gpu_ptr<void>(input),
+        input.size(),
+        mpi().datatype(input),
+        gpu_ptr<void>(output),
+        input.size(),
+        mpi().datatype(output),
+        comm_);
+    if (result != MPI_SUCCESS) {
+      throw std::runtime_error("[mpi] MPI_Allgather failed.");
+    }
+  }
+
+  void send_gpu(const array& input, int dst, Stream stream) {
+    if (!has_cuda_) {
+      throw std::runtime_error(
+          "[mpi] CUDA stream requested but CUDA backend is not available.");
+    }
+    auto& encoder = cu::get_command_encoder(stream);
+    encoder.set_input_array(input);
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(encoder.stream()));
+    int result = mpi().send(
+        gpu_ptr<void>(input),
+        input.size(),
+        mpi().datatype(input),
+        dst,
+        0,
+        comm_);
+    if (result != MPI_SUCCESS) {
+      throw std::runtime_error("[mpi] MPI_Send failed.");
+    }
+  }
+
+  void recv_gpu(array& out, int src, Stream stream) {
+    if (!has_cuda_) {
+      throw std::runtime_error(
+          "[mpi] CUDA stream requested but CUDA backend is not available.");
+    }
+    auto& encoder = cu::get_command_encoder(stream);
+    encoder.set_output_array(out);
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(encoder.stream()));
+    MPI_Status status;
+    int result = mpi().recv(
+        gpu_ptr<void>(out),
+        out.size(),
+        mpi().datatype(out),
+        src,
+        MPI_ANY_TAG,
+        comm_,
+        &status);
+    if (result != MPI_SUCCESS) {
+      throw std::runtime_error("[mpi] MPI_Recv failed.");
+    }
+  }
+#else
+  void dispatch_all_reduce(
+      const array& input,
+      array& output,
+      Stream stream,
+      ReduceType reduce) {
+#if defined(MLX_BUILD_CPU)
+    if (is_gpu_stream(stream)) {
+      throw std::runtime_error(
+          "[mpi] CUDA stream requested but CUDA support is not enabled.");
+    }
+    all_reduce_cpu(input, output, stream, mpi_op(reduce, input));
+#else
+    throw std::runtime_error("[mpi] MPI backend not available.");
+#endif
+  }
+#endif
+
   MPI_Comm comm_;
   bool global_;
   int rank_;
   int size_;
+  bool has_cuda_;
 };
 
 bool is_available() {

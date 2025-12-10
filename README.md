@@ -91,6 +91,9 @@ Checkout the
 [documentation](https://ml-explore.github.io/mlx/build/html/install.html#)
 for more information on building the C++ and Python APIs from source.
 
+For CUDA+MPI distributed setups that mix Apple Silicon with NVIDIA PCs, see
+[CUDA + MPI Distributed Guide](docs/CUDA_MPI_CLUSTER.md).
+
 ## Contributing
 
 Check out the [contribution guidelines](https://github.com/ml-explore/mlx/tree/main/CONTRIBUTING.md) for more information

@@ -13,6 +13,11 @@ class GroupImpl {
  public:
   virtual ~GroupImpl() {}
 
+  // Whether CUDA graph capture is safe for this backend.
+  virtual bool supports_cuda_graphs() const {
+    return true;
+  }
+
   // Choose the stream this communication group can operate on
   virtual Stream communication_stream(StreamOrDevice s = {}) = 0;
 

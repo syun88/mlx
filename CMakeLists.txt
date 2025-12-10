@@ -93,6 +93,10 @@ add_library(mlx)
 # ‘std::pair<float, float>’ when C++17 is enabled changed to match C++14 in GCC
 # 10.1
 target_compile_options(mlx PRIVATE -Wno-psabi)
+target_compile_definitions(
+  mlx
+  PRIVATE $<$<BOOL:${MLX_BUILD_CPU}>:MLX_BUILD_CPU>
+          $<$<BOOL:${MLX_BUILD_CUDA}>:MLX_BUILD_CUDA>)
 
 if(MLX_BUILD_CUDA)
   enable_language(CUDA)

@@ -1,4 +1,4 @@
-if(MLX_BUILD_CPU)
+if(MLX_BUILD_CPU OR MLX_BUILD_CUDA)
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/mpi.cpp)
 else()
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/no_mpi.cpp)

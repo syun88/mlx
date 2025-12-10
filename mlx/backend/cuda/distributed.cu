@@ -6,6 +6,7 @@
 #include "mlx/distributed/primitives.h"
 #include "mlx/primitives.h"
 
+#include <optional>
 #include <cassert>
 
 namespace mlx::core::distributed {
@@ -36,7 +37,10 @@ void AllReduce::eval_gpu(
   encoder.set_input_array(input);
   encoder.set_output_array(output);
 
-  auto capture = encoder.capture_context();
+  std::optional<cu::CommandEncoder::CaptureContext> capture;
+  if (group().raw_group()->supports_cuda_graphs()) {
+    capture.emplace(encoder);
+  }
 
   switch (reduce_type_) {
     case Sum:
@@ -79,7 +83,10 @@ void AllGather::eval_gpu(
   encoder.set_input_array(input);
   encoder.set_output_array(outputs[0]);
 
-  auto capture = encoder.capture_context();
+  std::optional<cu::CommandEncoder::CaptureContext> capture;
+  if (group().raw_group()->supports_cuda_graphs()) {
+    capture.emplace(encoder);
+  }
   distributed::detail::all_gather(group(), input, outputs[0], s);
 }
 
@@ -108,7 +115,10 @@ void ReduceScatter::eval_gpu(
   encoder.set_input_array(input);
   encoder.set_output_array(outputs[0]);
 
-  auto capture = encoder.capture_context();
+  std::optional<cu::CommandEncoder::CaptureContext> capture;
+  if (group().raw_group()->supports_cuda_graphs()) {
+    capture.emplace(encoder);
+  }
 
   switch (reduce_type_) {
     case Sum:
